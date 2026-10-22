@@ -1,0 +1,114 @@
+name: WIFI助手 - Windows 便携版 + Ubuntu 26.04 DEB
+
+on:
+  push:
+    branches: [main, master]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  windows-portable:
+    name: 1 / Windows x64 Portable ZIP
+    runs-on: windows-latest
+    timeout-minutes: 50
+    steps:
+      - name: Checkout source
+        uses: actions/checkout@v5
+
+      - name: Install .NET 10 SDK
+        uses: actions/setup-dotnet@v5
+        with:
+          dotnet-version: '10.0.x'
+
+      - name: Build Windows portable EXE and ZIP
+        shell: pwsh
+        run: ./Windows/package-portable.ps1 -Runtime win-x64
+
+      - name: Verify EXE ZIP and SHA256
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $zip = 'Windows/dist/WiFiAssistant-Windows-x64-Portable-1.0.0.zip'
+          $hashFile = "$zip.sha256"
+          if (-not (Test-Path $zip) -or -not (Test-Path $hashFile)) { throw 'Missing ZIP/hash' }
+          $archive = [System.IO.Compression.ZipFile]::OpenRead((Resolve-Path $zip).Path)
+          try {
+            $entries = @($archive.Entries | ForEach-Object { $_.FullName.Replace('\', '/') })
+            foreach ($f in @('WiFiAssistant.exe','onnxruntime.dll','onnxruntime_providers_shared.dll','models/captcha-common.onnx','models/captcha-digits.json','models/SOURCE.json')) {
+              if ($entries -notcontains $f) { throw "Missing $f" }
+            }
+          } finally { $archive.Dispose() }
+          $actual = (Get-FileHash $zip -Algorithm SHA256).Hash.ToLowerInvariant()
+          $recorded = (Get-Content $hashFile -Raw).Trim().Split(' ')[0]
+          if ($actual -ne $recorded) { throw 'ZIP hash mismatch' }
+          Write-Host ("Windows portable ZIP: {0:N2} MB" -f ((Get-Item $zip).Length / 1MB))
+
+      - name: Upload Windows portable version
+        uses: actions/upload-artifact@v6
+        with:
+          name: WIFI助手-Windows-x64-Portable-1.0.0
+          path: |
+            Windows/dist/WiFiAssistant-Windows-x64-Portable-1.0.0.zip
+            Windows/dist/WiFiAssistant-Windows-x64-Portable-1.0.0.zip.sha256
+          if-no-files-found: error
+          retention-days: 30
+
+  ubuntu-deb:
+    name: 2 / Ubuntu 26.04 x64 DEB
+    needs: windows-portable
+    runs-on: ubuntu-26.04
+    timeout-minutes: 35
+    steps:
+      - name: Checkout source
+        uses: actions/checkout@v5
+
+      - name: Install Ubuntu build and authentication dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y python3-venv python3-tk python3-gi \
+            gir1.2-gtk-3.0 gir1.2-webkit2-4.1 libsecret-tools network-manager xvfb xauth
+          python3 -m venv Ubuntu/.build-venv
+          Ubuntu/.build-venv/bin/python -m pip install 'pyinstaller>=6.22.3,<7'
+
+      - name: Run Ubuntu unit tests
+        run: |
+          python3 -m py_compile Ubuntu/main.py Ubuntu/package.py Ubuntu/portal_window.py Ubuntu/credentials.py Ubuntu/instance.py
+          python3 -m unittest discover -s Ubuntu -p 'test_*.py' -v
+
+      - name: Smoke-test Ubuntu main UI and embedded portal
+        run: |
+          xvfb-run -a python3 Ubuntu/main.py --smoke-test
+          xvfb-run -a /usr/bin/python3 Ubuntu/portal_window.py --smoke-test
+
+      - name: Build Linux binary
+        run: |
+          Ubuntu/.build-venv/bin/python -m PyInstaller --noconfirm --clean --onefile --windowed \
+            --name WiFiAssistant --distpath Ubuntu/dist \
+            --workpath Ubuntu/work --specpath Ubuntu/work Ubuntu/main.py
+          xvfb-run -a Ubuntu/dist/WiFiAssistant --smoke-test
+
+      - name: Build and verify Ubuntu DEB
+        run: |
+          set -euo pipefail
+          python3 Ubuntu/package.py
+          deb=Ubuntu/dist/wifi-assistant_1.0.0_amd64.deb
+          test "$(dpkg-deb -f "$deb" Architecture)" = amd64
+          test "$(dpkg-deb -f "$deb" Version)" = 1.0.0
+          dpkg-deb -c "$deb" | grep -F /usr/share/wifi-assistant/portal_window.py
+          root="$(mktemp -d)"
+          trap 'rm -rf "$root"' EXIT
+          dpkg-deb -x "$deb" "$root"
+          xvfb-run -a "$root/usr/bin/wifi-assistant" --smoke-test
+          sha256sum "$deb" > "${deb}.sha256"
+
+      - name: Upload Ubuntu DEB
+        uses: actions/upload-artifact@v6
+        with:
+          name: WIFI助手-Ubuntu-26.04-amd64-DEB-1.0.0
+          path: |
+            Ubuntu/dist/wifi-assistant_1.0.0_amd64.deb
+            Ubuntu/dist/wifi-assistant_1.0.0_amd64.deb.sha256
+          if-no-files-found: error
+          retention-days: 30
