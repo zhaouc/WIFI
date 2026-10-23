@@ -35,7 +35,10 @@ def run_nmcli(*args: str) -> str:
     """Never invoke a shell: SSIDs are passed as literal arguments."""
     if not shutil.which("nmcli"):
         raise RuntimeError("需要安装 NetworkManager（nmcli）")
-    result = subprocess.run(["nmcli", *args], capture_output=True, text=True, timeout=90 if "up" in args or "connect" in args else 20, check=False)
+    # NetworkManager state strings are localized; parse a stable English state.
+    result = subprocess.run(["nmcli", *args], capture_output=True, text=True,
+                            env={**os.environ, "LC_ALL": "C"},
+                            timeout=90 if "up" in args or "connect" in args else 20, check=False)
     if result.returncode:
         raise RuntimeError((result.stderr or result.stdout or "NetworkManager 操作失败").strip())
     return result.stdout
@@ -111,13 +114,55 @@ def needs_reconnect(mode: str, ssid: str, active_connections: str) -> bool:
 
 
 
-def active_wifi_ssid(network_list: str) -> str:
-    """Read the active SSID from escaped nmcli IN-USE:SSID records."""
-    for line in network_list.splitlines():
+def current_network(runner) -> dict | None:
+    """Read actual link state from NetworkManager, not cached Wi-Fi scan results.
+
+    `nmcli device wifi list` can omit the IN-USE marker while an interface is
+    connected (hidden networks, stale AP cache, roaming, or scan unavailable).
+    DEVICE,TYPE,STATE,CONNECTION is NetworkManager's authoritative interface
+    state. Resolve the active profile's real SSID separately: connection names
+    do not have to match their SSIDs.
+    """
+    devices = runner('-t', '-f', 'DEVICE,TYPE,STATE,CONNECTION', 'device', 'status')
+    wifi, wired = [], []
+    for line in devices.splitlines():
         fields = split_nmcli(line)
-        if len(fields) >= 2 and fields[0].strip() == '*':
-            return fields[1]
-    return ''
+        if len(fields) < 4:
+            continue
+        device, kind, state, profile = (field.strip() for field in fields[:4])
+        if not state.lower().startswith('connected'):
+            continue
+        if kind.lower() in ('wifi', '802-11-wireless'):
+            wifi.append((device, profile))
+        elif kind.lower() in ('ethernet', '802-3-ethernet'):
+            wired.append((device, profile))
+    if wifi:
+        device, profile = wifi[0]
+        ssid = ''
+        # A profile can be named anything, e.g. "My campus Wi-Fi profile".
+        # Query the active UUID so the campus auto-login is restricted to the
+        # configured real SSID rather than an unrelated saved profile name.
+        try:
+            active = runner('-t', '-f', 'UUID,TYPE,DEVICE', 'connection', 'show', '--active')
+            for line in active.splitlines():
+                fields = split_nmcli(line)
+                if len(fields) < 3:
+                    continue
+                uuid, kind, active_device = fields[:3]
+                if active_device == device and kind.lower() in ('wifi', '802-11-wireless') and uuid:
+                    candidate = runner('-g', '802-11-wireless.ssid', 'connection', 'show', 'uuid', uuid).strip()
+                    if candidate not in ('', '--'):
+                        ssid = candidate
+                    break
+        except (RuntimeError, OSError, subprocess.TimeoutExpired):
+            # The connection is still physically active even if SSID lookup
+            # fails; never turn an SSID lookup error into "not connected".
+            pass
+        return {'mode': 'wifi', 'device': device, 'profile': profile, 'ssid': ssid}
+    if wired:
+        device, profile = wired[0]
+        return {'mode': 'wired', 'device': device, 'profile': profile, 'ssid': ''}
+    return None
 
 
 def portal_check_needed(state: str, *, online_probe=None) -> bool:
@@ -230,6 +275,9 @@ class App(tk.Tk):
         self.username.trace_add("write", lambda *_: self._credential_target_changed('portal'))
         self.show_page("dashboard")
         self.after(250, self.refresh_networks)
+        # Keep the display current even when Wi-Fi is connected by the OS.
+        # This refresh never initiates a connection; reconnection stays at 5 minutes.
+        self.after(60_000, self._periodic_status_refresh)
         if '--smoke-test' not in sys.argv:
             threading.Thread(target=self._load_secrets, daemon=True).start()
         # Initial check shortly after startup, then every five minutes.
@@ -395,15 +443,19 @@ class App(tk.Tk):
         except OSError as e:
             self.save_indicator.configure(text="保存失败：" + str(e))
 
+    def _periodic_status_refresh(self):
+        self.refresh_networks()
+        self.after(60_000, self._periodic_status_refresh)
+
     def refresh_networks(self):
         if self.scan_busy:
             return
         self.scan_busy = True
-        self.display_status.set("正在更新 Wi-Fi 状态…")
+        self.display_status.set("正在读取当前网络连接…")
         def run():
             try:
-                networks = parse_networks(run_nmcli("-t", "-f", "IN-USE,SSID,SIGNAL,SECURITY", "device", "wifi", "list", "--rescan", "auto"))
-                self.after(0, lambda: self._update_networks(networks))
+                connection = current_network(run_nmcli)
+                self.after(0, lambda: self._update_networks(connection))
             except Exception as e:
                 error = str(e)
                 self.after(0, lambda: self._scan_failed(error))
@@ -411,12 +463,24 @@ class App(tk.Tk):
 
     def _scan_failed(self, error):
         self.scan_busy = False
-        self.display_status.set("Wi-Fi 扫描失败：" + error)
+        # A command failure is not evidence that Wi-Fi has disconnected.
+        self.connection_label.configure(text="无法读取网络状态")
+        self.display_status.set("网络状态查询失败：" + error)
 
-    def _update_networks(self, networks):
+    def _update_networks(self, connection):
         self.scan_busy = False
-        connected = next((n for n in networks if n["connected"]), None)
-        self.connection_label.configure(text=("已连接：" + connected["ssid"]) if connected else "当前未连接 Wi-Fi")
+        if connection and connection['mode'] == 'wifi':
+            if connection['ssid']:
+                description = "已连接 Wi-Fi：" + connection['ssid']
+            elif connection['profile'] and connection['profile'] != '--':
+                description = "已连接 Wi-Fi（配置：" + connection['profile'] + "）"
+            else:
+                description = "Wi-Fi 已连接"
+        elif connection and connection['mode'] == 'wired':
+            description = "已连接有线网络"
+        else:
+            description = "当前未连接 Wi-Fi"
+        self.connection_label.configure(text=description)
         self.target_label.configure(text="目标校园网络：" + (self.ssid.get() or "尚未设置"))
         self.display_status.set("网络状态已更新")
 
@@ -623,9 +687,10 @@ class App(tk.Tk):
                             # Do not send campus credentials when the computer is
                             # connected to a different Wi-Fi network.
                             if mode == 'wifi':
-                                current_wifi = active_wifi_ssid(run_nmcli('-t', '-f', 'IN-USE,SSID',
-                                    'device', 'wifi', 'list', '--rescan', 'no'))
-                                if current_wifi != ssid:
+                                current_link = current_network(run_nmcli)
+                                # Only send campus login credentials after we
+                                # have verified the *real* active SSID.
+                                if not current_link or current_link['mode'] != 'wifi' or current_link['ssid'] != ssid:
                                     self.after(0, self._finish_auto_check)
                                     return
                             connectivity = run_nmcli('networking', 'connectivity', 'check')
